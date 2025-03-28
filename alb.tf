@@ -1,21 +1,20 @@
-# Create one load balancer per cluster
+# Create load balancer
 resource "aws_lb" "cluster_lb" {
-  count              = 2  # One for each cluster
-  name               = "${var.projectName}-lb-cluster-${count.index + 1}"
+  name               = "${var.projectName}-${var.clusterName}-lb"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.lb.id]
   subnets            = aws_subnet.public[*].id
   
   tags = {
-    Name = "${var.projectName}-lb-cluster-${count.index + 1}"
+    Name = "${var.projectName}-${var.clusterName}-lb"
   }
 }
 
-# Create target groups for each service in each cluster
+# Create target groups for each service
 resource "aws_lb_target_group" "service_tg" {
-  count       = 4  # One for each service in each cluster
-  name        = "${var.projectName}-tg-c${floor(count.index / 2) + 1}-s${count.index % 2 == 0 ? "a" : "b"}"
+  for_each    = toset(["A", "B"])
+  name        = "${var.projectName}-${var.clusterName}-tg-s${lower(each.key)}"
   port        = 80
   protocol    = "HTTP"
   vpc_id      = aws_vpc.main.id
@@ -32,29 +31,27 @@ resource "aws_lb_target_group" "service_tg" {
   }
 }
 
-# Create listeners for each load balancer - routing to different services based on path
+# Create listener - routing to different services based on path
 resource "aws_lb_listener" "cluster_listener" {
-  count             = 2  # One for each cluster
-  load_balancer_arn = aws_lb.cluster_lb[count.index].arn
+  load_balancer_arn = aws_lb.cluster_lb.arn
   port              = 80
   protocol          = "HTTP"
   
   # Default action routes to ServiceA
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.service_tg[count.index * 2].arn  # ServiceA for this cluster
+    target_group_arn = aws_lb_target_group.service_tg["A"].arn
   }
 }
 
 # Add listener rule for ServiceB on path /serviceb
 resource "aws_lb_listener_rule" "serviceb_rule" {
-  count        = 2  # One for each cluster
-  listener_arn = aws_lb_listener.cluster_listener[count.index].arn
+  listener_arn = aws_lb_listener.cluster_listener.arn
   priority     = 100
   
   action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.service_tg[count.index * 2 + 1].arn  # ServiceB for this cluster
+    target_group_arn = aws_lb_target_group.service_tg["B"].arn
   }
   
   condition {
@@ -64,11 +61,8 @@ resource "aws_lb_listener_rule" "serviceb_rule" {
   }
 }
 
-# Output load balancer URLs
-output "public_endpoints" {
-  value = {
-    cluster1 = aws_lb.cluster_lb[0].dns_name
-    cluster2 = aws_lb.cluster_lb[1].dns_name
-  }
-  description = "Public URLs for each cluster's load balancer (default path for ServiceA, /serviceb for ServiceB)"
+# Output load balancer URL
+output "public_endpoint" {
+  value = aws_lb.cluster_lb.dns_name
+  description = "Public URL for the cluster's load balancer (default path for ServiceA, /serviceb for ServiceB)"
 }

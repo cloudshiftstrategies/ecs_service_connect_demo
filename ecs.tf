@@ -1,6 +1,6 @@
 # IAM role for ECS execution
 resource "aws_iam_role" "ecs_execution" {
-  name = "${var.projectName}-ecs-execution-role"
+  name = "${var.projectName}-${var.clusterName}-execution-role"
   
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -21,48 +21,79 @@ resource "aws_iam_role_policy_attachment" "ecs_execution" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# Create two ECS clusters using count
-resource "aws_ecs_cluster" "clusters" {
-  count = 2
-  name  = "${var.projectName}-cluster-${count.index + 1}"
+# Add CloudWatch logs policy
+resource "aws_iam_role_policy" "ecs_cloudwatch_logs" {
+  name = "${var.projectName}-${var.clusterName}-cloudwatch-logs"
+  role = aws_iam_role.ecs_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = ["arn:aws:logs:*:*:*"]
+      }
+    ]
+  })
 }
 
-# Create two Service Connect namespaces
+# Create ECS cluster
+resource "aws_ecs_cluster" "cluster" {
+  name = "${var.projectName}-${var.clusterName}"
+}
+
+# Create Service Connect namespace
 resource "aws_service_discovery_http_namespace" "namespace" {
-  count = 2
-  name        = "${var.projectName}-namespace-${count.index + 1}"
-  description = "${var.projectName} namespace for Service Connect"
+  name        = "${var.projectName}-${var.clusterName}-namespace"
+  description = "${var.projectName} namespace for ${var.clusterName}"
 }
 
-# Update task definitions for ServiceA with custom nginx page that tests service discovery
+# Create task definitions for ServiceA and ServiceB
 resource "aws_ecs_task_definition" "services" {
-  count                    = 2
-  family                   = "${var.projectName}-service${count.index == 0 ? "A" : "B"}"
-  network_mode             = "awsvpc"
+  for_each                = toset(["A", "B"])
+  family                  = "${var.projectName}-${var.clusterName}-service${each.key}"
+  network_mode           = "awsvpc"
   requires_compatibilities = ["FARGATE"]
-  cpu                      = "256"
-  memory                   = "512"
-  execution_role_arn       = aws_iam_role.ecs_execution.arn
+  cpu                    = "256"
+  memory                 = "512"
+  execution_role_arn     = aws_iam_role.ecs_execution.arn
   
   container_definitions = jsonencode([
     {
-      name      = "${var.projectName}-service${count.index == 0 ? "A" : "B"}"
+      name      = "${var.projectName}-service${each.key}"
       image     = "nginx:latest"
       essential = true
       
+      # Add CloudWatch logging configuration
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = "/ecs/${var.projectName}-${var.clusterName}-service${each.key}"
+          "awslogs-region"        = var.region
+          "awslogs-stream-prefix" = "ecs"
+          "awslogs-create-group"  = "true"
+        }
+      }
+      
       # Prepare custom nginx configuration with CORS headers enabled for service discovery test
       command = [
-        "/bin/sh", 
-        "-c", 
-        "echo 'server { listen 80; server_name localhost; location / { add_header Access-Control-Allow-Origin \"*\"; root /usr/share/nginx/html; index index.html; } }' > /etc/nginx/conf.d/default.conf && echo '<html><body style=\"background-color: ${count.index == 0 ? "#e6f7ff" : "#ffe6e6"}\"><h1>This is service${count.index == 0 ? "A" : "B"} in cluster $CLUSTER_NAME</h1><p>Container ID: '$(hostname)'</p><div id=\"result\"><h2>Service Discovery Test:</h2><p>Click the button to test connection to service${count.index == 0 ? "B" : "A"}</p><button onclick=\"testServiceDiscovery()\">Test Connection</button><div id=\"response\"></div></div><script>function testServiceDiscovery() {document.getElementById(\"response\").innerHTML = \"<p>Testing connection...</p>\";fetch(\"http://service${count.index == 0 ? "b" : "a"}\", {method: \"GET\"}).then(response => response.text()).then(data => {const parser = new DOMParser();const htmlDoc = parser.parseFromString(data, \"text/html\");const title = htmlDoc.querySelector(\"h1\").textContent;document.getElementById(\"response\").innerHTML = \"<p>Connected successfully! Response: \" + title + \"</p>\";}).catch(error => {document.getElementById(\"response\").innerHTML = \"<p>Error: \" + error + \"</p>\";})}</script></body></html>' > /usr/share/nginx/html/index.html && nginx -g 'daemon off;'"
-      ]
-      
-      # Environment variables to identify the cluster
-      environment = [
-        {
-          name = "CLUSTER_NAME",
-          value = "cluster${count.index == 0 ? "1" : "2"}"
-        }
+        "/bin/sh",
+        "-c",
+        join(" && ", [
+          "cat > /etc/nginx/conf.d/default.conf << 'EOL'\n${file("nginx.conf")}\nEOL",
+          "cat > /usr/share/nginx/html/index.html << \"EOL\"\n${templatefile("index.html.tpl", {
+            service_type = each.key,
+            cluster_name = "${var.projectName}-${var.clusterName}",
+            other_service = each.key == "A" ? "B" : "A",
+            other_service_lower = each.key == "A" ? "b" : "a"
+          })}\nEOL",
+          "nginx -g 'daemon off;'"
+        ])
       ]
       
       portMappings = [
@@ -76,12 +107,12 @@ resource "aws_ecs_task_definition" "services" {
   ])
 }
 
-# Update ECS services with load balancer registration
+# Create ECS services
 resource "aws_ecs_service" "services" {
-  count           = 4
-  name            = "${var.projectName}-service${count.index % 2 == 0 ? "A" : "B"}"
-  cluster         = aws_ecs_cluster.clusters[floor(count.index / 2)].id
-  task_definition = aws_ecs_task_definition.services[count.index % 2].arn
+  for_each        = toset(["A", "B"])
+  name            = "${var.projectName}-${var.clusterName}-service${each.key}"
+  cluster         = aws_ecs_cluster.cluster.id
+  task_definition = aws_ecs_task_definition.services[each.key].arn
   desired_count   = 1
   launch_type     = "FARGATE"
   
@@ -93,22 +124,22 @@ resource "aws_ecs_service" "services" {
   
   service_connect_configuration {
     enabled   = true
-    namespace = aws_service_discovery_http_namespace.namespace[floor(count.index / 2)].arn
+    namespace = aws_service_discovery_http_namespace.namespace.arn
     
     service {
       client_alias {
         port     = 80
-        dns_name = "service${count.index % 2 == 0 ? "a" : "b"}"
+        dns_name = "service${lower(each.key)}"
       }
       port_name      = "http"
-      discovery_name = "service${count.index % 2 == 0 ? "a" : "b"}"
+      discovery_name = "service${lower(each.key)}"
     }
   }
   
   # Register with load balancer
   load_balancer {
-    target_group_arn = aws_lb_target_group.service_tg[count.index].arn
-    container_name   = "${var.projectName}-service${count.index % 2 == 0 ? "A" : "B"}"
+    target_group_arn = aws_lb_target_group.service_tg[each.key].arn
+    container_name   = "${var.projectName}-service${each.key}"
     container_port   = 80
   }
 }

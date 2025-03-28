@@ -1,6 +1,11 @@
 variable "projectName" {
     type = string
-    default = "ServiceConnectDemo"
+    default = "SvcCxDemo"
+}
+
+variable "clusterName" {
+    type = string
+    description = "Name of the cluster (e.g., cluster-1 or cluster-2)"
 }
 
 variable "cidr" {
